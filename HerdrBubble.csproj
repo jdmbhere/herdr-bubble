@@ -10,7 +10,7 @@
     <AssemblyName>HerdrBubble</AssemblyName>
     <RootNamespace>HerdrBubble</RootNamespace>
     <ApplicationIcon>app.ico</ApplicationIcon>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>je1nsprogram</Authors>
     <Description>Floating AssistiveTouch-style terminal toggle bubble for Windows.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
