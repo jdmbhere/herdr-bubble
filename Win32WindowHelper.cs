@@ -18,15 +18,29 @@ public static class Win32WindowHelper
     private const int SW_RESTORE = 9;
     private const int SW_MINIMIZE = 6;
     private const int SW_SHOW = 5;
+    private const int SW_SHOWNORMAL = 1;
 
     private const int GWL_EXSTYLE = -20;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
+    private const long WS_EX_TOPMOST = 0x00000008;
+    private const int WS_EX_TRANSPARENT = 0x00000020;
+    private const int WS_EX_NOACTIVATE = 0x08000000;
+    private const int WS_EX_LAYERED = 0x00080000;
+    private const uint LWA_ALPHA = 0x00000002;
     private const int DWMWA_CLOAKED = 14;
+    private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    private const int DWMWCP_ROUND = 2;
+    private const int DWMWA_TRANSITIONS_FORCEDISABLED = 3;
+    private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+    private const int WPF_RESTORETOMAXIMIZED = 0x0002;
+    private const int SW_SHOWMAXIMIZED = 3;
 
     private static readonly IntPtr HWND_TOPMOST = new(-1);
     private const uint SWP_NOSIZE = 0x0001;
     private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOZORDER = 0x0004;
     private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
     private const uint MONITOR_DEFAULTTONULL = 0x00000000;
     private const uint MONITOR_DEFAULTTOPRIMARY = 0x00000001;
     private const uint MONITOR_DEFAULTTONEAREST = 0x00000002;
@@ -80,6 +94,17 @@ public static class Win32WindowHelper
         public uint dwFlags;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINDOWPLACEMENT
+    {
+        public int length;
+        public int flags;
+        public int showCmd;
+        public POINT ptMinPosition;
+        public POINT ptMaxPosition;
+        public RECT rcNormalPosition;
+    }
+
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
@@ -122,6 +147,27 @@ public static class Win32WindowHelper
     [DllImport("dwmapi.dll")]
     private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    private static extern int DwmGetWindowAttributeRect(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPlacement(IntPtr hWnd, [In] ref WINDOWPLACEMENT lpwndpl);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromRect(ref RECT lprc, uint dwFlags);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+    private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+    private static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+
     [DllImport("user32.dll")]
     private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
@@ -149,6 +195,9 @@ public static class Win32WindowHelper
     [DllImport("user32.dll")]
     private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
+    [DllImport("user32.dll")]
+    private static extern bool SetLayeredWindowAttributes(IntPtr hwnd, uint crKey, byte bAlpha, uint dwFlags);
+
     /// <summary>
     /// Returns the working areas of all active monitors in physical screen pixels.
     /// </summary>
@@ -173,6 +222,9 @@ public static class Win32WindowHelper
         return areas;
     }
 
+    public static bool IsWindowTopmost(IntPtr hWnd) =>
+        IsHandleValid(hWnd) && (GetWindowExStyle(hWnd) & WS_EX_TOPMOST) != 0;
+
     public static void EnsureTopmostNoActivate(IntPtr hWnd)
     {
         if (IsHandleValid(hWnd))
@@ -194,6 +246,350 @@ public static class Win32WindowHelper
         }
 
         return Rect.Empty;
+    }
+
+    /// <summary>
+    /// Returns the visually visible frame bounds (excluding the invisible resize border),
+    /// falling back to the raw window rect when DWM does not report bounds.
+    /// </summary>
+    public static Rect GetVisibleWindowRectPixels(IntPtr hWnd)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return Rect.Empty;
+        }
+
+        try
+        {
+            int hr = DwmGetWindowAttributeRect(
+                hWnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                out RECT r,
+                Marshal.SizeOf<RECT>());
+
+            if (hr == 0 && r.Right > r.Left && r.Bottom > r.Top)
+            {
+                return new Rect(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+            }
+        }
+        catch
+        {
+            // Fall through to the legacy window rect below.
+        }
+
+        return GetWindowRectPixels(hWnd);
+    }
+
+    /// <summary>
+    /// Compares the raw window rect against the DWM visible frame and returns the
+    /// invisible frame padding encoded as (insetLeft, insetTop, widthPad, heightPad).
+    /// </summary>
+    public static Rect GetWindowFrameInsetsPixels(IntPtr hWnd)
+    {
+        Rect raw = GetWindowRectPixels(hWnd);
+        Rect visible = GetVisibleWindowRectPixels(hWnd);
+
+        if (raw.IsEmpty || visible.IsEmpty || raw.Width <= 0 || raw.Height <= 0)
+        {
+            return new Rect(0, 0, 0, 0);
+        }
+
+        double insetLeft = Math.Max(0, visible.Left - raw.Left);
+        double insetTop = Math.Max(0, visible.Top - raw.Top);
+        double widthPad = Math.Max(0, raw.Width - visible.Width);
+        double heightPad = Math.Max(0, raw.Height - visible.Height);
+
+        return new Rect(insetLeft, insetTop, widthPad, heightPad);
+    }
+
+    /// <summary>
+    /// Expands a visible-frame rect back into a raw window rect using frame insets.
+    /// </summary>
+    public static Rect ApplyFrameInsets(Rect visibleRectPx, Rect frameInsets) =>
+        new(
+            visibleRectPx.Left - frameInsets.Left,
+            visibleRectPx.Top - frameInsets.Top,
+            visibleRectPx.Width + frameInsets.Width,
+            visibleRectPx.Height + frameInsets.Height);
+
+    /// <summary>
+    /// Sets the normal (restored) position of a minimized window so it restores at the
+    /// requested raw rect. Window placement coordinates are workspace-relative.
+    /// </summary>
+    public static void SetMinimizedNormalRect(IntPtr hWnd, Rect rawTargetRectPx)
+    {
+        if (!IsHandleValid(hWnd) || rawTargetRectPx.IsEmpty)
+        {
+            return;
+        }
+
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hWnd, ref wp))
+        {
+            return;
+        }
+
+        (Rect primaryBounds, Rect primaryWork) = GetPrimaryMonitorBoundsAndWorkArea();
+        double offsetX = primaryWork.Left - primaryBounds.Left;
+        double offsetY = primaryWork.Top - primaryBounds.Top;
+
+        wp.rcNormalPosition = new RECT
+        {
+            Left = (int)Math.Round(rawTargetRectPx.Left - offsetX),
+            Top = (int)Math.Round(rawTargetRectPx.Top - offsetY),
+            Right = (int)Math.Round(rawTargetRectPx.Right - offsetX),
+            Bottom = (int)Math.Round(rawTargetRectPx.Bottom - offsetY)
+        };
+
+        SetWindowPlacement(hWnd, ref wp);
+    }
+
+    /// <summary>
+    /// Ensures a maximized window ends up maximized on the requested monitor work area.
+    /// </summary>
+    public static void MoveMaximizedWindowToMonitor(IntPtr hWnd, Rect targetMonitorWorkAreaPx)
+    {
+        if (!IsHandleValid(hWnd) || targetMonitorWorkAreaPx.IsEmpty)
+        {
+            return;
+        }
+
+        Rect visible = GetVisibleWindowRectPixels(hWnd);
+        if (!visible.IsEmpty)
+        {
+            Rect currentWorkArea = GetMonitorWorkAreaForPointPixels(
+                visible.Left + visible.Width * 0.5,
+                visible.Top + visible.Height * 0.5);
+
+            if (RectsMatchWithin(currentWorkArea, targetMonitorWorkAreaPx, 2.0))
+            {
+                return;
+            }
+        }
+
+        ShowWindow(hWnd, SW_SHOWNORMAL);
+        MoveAndResizeWindowPixels(
+            hWnd,
+            (int)Math.Round(targetMonitorWorkAreaPx.Left),
+            (int)Math.Round(targetMonitorWorkAreaPx.Top),
+            (int)Math.Round(targetMonitorWorkAreaPx.Width),
+            (int)Math.Round(targetMonitorWorkAreaPx.Height),
+            topmost: false);
+        ShowWindow(hWnd, SW_SHOWMAXIMIZED);
+    }
+
+    private static (Rect bounds, Rect work) GetPrimaryMonitorBoundsAndWorkArea()
+    {
+        Rect primaryWork = GetPrimaryMonitorWorkAreaPixels();
+        Rect primaryBounds = primaryWork;
+
+        IntPtr primaryMonitor = MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (primaryMonitor != IntPtr.Zero && GetMonitorInfo(primaryMonitor, ref info))
+        {
+            RECT m = info.rcMonitor;
+            primaryBounds = new Rect(m.Left, m.Top, Math.Max(1, m.Right - m.Left), Math.Max(1, m.Bottom - m.Top));
+
+            RECT w = info.rcWork;
+            primaryWork = new Rect(w.Left, w.Top, Math.Max(1, w.Right - w.Left), Math.Max(1, w.Bottom - w.Top));
+        }
+
+        return (primaryBounds, primaryWork);
+    }
+
+    private static bool RectsMatchWithin(Rect a, Rect b, double tolerance) =>
+        Math.Abs(a.Left - b.Left) <= tolerance
+        && Math.Abs(a.Top - b.Top) <= tolerance
+        && Math.Abs(a.Width - b.Width) <= tolerance
+        && Math.Abs(a.Height - b.Height) <= tolerance;
+
+    public static bool IsRestoredAsMaximized(IntPtr hWnd)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return false;
+        }
+
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hWnd, ref wp))
+        {
+            return false;
+        }
+
+        return wp.showCmd == SW_SHOWMAXIMIZED
+            || (wp.flags & WPF_RESTORETOMAXIMIZED) != 0;
+    }
+
+    /// <summary>
+    /// Predicts where a minimized window will land when restored, in physical screen pixels.
+    /// </summary>
+    public static Rect GetPredictedWindowRectPixels(IntPtr hWnd)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return Rect.Empty;
+        }
+
+        if (!IsIconic(hWnd))
+        {
+            return GetVisibleWindowRectPixels(hWnd);
+        }
+
+        var wp = new WINDOWPLACEMENT { length = Marshal.SizeOf<WINDOWPLACEMENT>() };
+        if (!GetWindowPlacement(hWnd, ref wp))
+        {
+            return Rect.Empty;
+        }
+
+        Rect primaryWork = GetPrimaryMonitorWorkAreaPixels();
+        Rect primaryBounds = primaryWork;
+
+        IntPtr primaryMonitor = MonitorFromPoint(new POINT { X = 0, Y = 0 }, MONITOR_DEFAULTTOPRIMARY);
+        var primaryInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (primaryMonitor != IntPtr.Zero && GetMonitorInfo(primaryMonitor, ref primaryInfo))
+        {
+            RECT m = primaryInfo.rcMonitor;
+            primaryBounds = new Rect(m.Left, m.Top, Math.Max(1, m.Right - m.Left), Math.Max(1, m.Bottom - m.Top));
+
+            RECT w = primaryInfo.rcWork;
+            primaryWork = new Rect(w.Left, w.Top, Math.Max(1, w.Right - w.Left), Math.Max(1, w.Bottom - w.Top));
+        }
+
+        double offsetX = primaryWork.Left - primaryBounds.Left;
+        double offsetY = primaryWork.Top - primaryBounds.Top;
+
+        var roughRect = new RECT
+        {
+            Left = (int)Math.Round(wp.rcNormalPosition.Left + offsetX),
+            Top = (int)Math.Round(wp.rcNormalPosition.Top + offsetY),
+            Right = (int)Math.Round(wp.rcNormalPosition.Right + offsetX),
+            Bottom = (int)Math.Round(wp.rcNormalPosition.Bottom + offsetY)
+        };
+
+        Rect targetWorkArea = primaryWork;
+        IntPtr targetMonitor = MonitorFromRect(ref roughRect, MONITOR_DEFAULTTONEAREST);
+        var targetInfo = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (targetMonitor != IntPtr.Zero && GetMonitorInfo(targetMonitor, ref targetInfo))
+        {
+            RECT w = targetInfo.rcWork;
+            targetWorkArea = new Rect(w.Left, w.Top, Math.Max(1, w.Right - w.Left), Math.Max(1, w.Bottom - w.Top));
+        }
+
+        var normalPos = new Rect(
+            wp.rcNormalPosition.Left,
+            wp.rcNormalPosition.Top,
+            wp.rcNormalPosition.Right - wp.rcNormalPosition.Left,
+            wp.rcNormalPosition.Bottom - wp.rcNormalPosition.Top);
+
+        bool restoreToMaximized = wp.showCmd == SW_SHOWMAXIMIZED
+            || (wp.flags & WPF_RESTORETOMAXIMIZED) != 0;
+
+        return WindowTransitionGeometry.ComputePredictedRestoreRect(
+            normalPos,
+            restoreToMaximized,
+            primaryBounds,
+            primaryWork,
+            targetWorkArea);
+    }
+
+    public static void PlaceWindowDirectlyBelow(IntPtr hWnd, IntPtr insertAfterHandle)
+    {
+        if (IsHandleValid(hWnd) && IsHandleValid(insertAfterHandle))
+        {
+            SetWindowPos(
+                hWnd,
+                insertAfterHandle,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
+    public static void MoveAndResizeWindowPixels(IntPtr hWnd, int x, int y, int width, int height, bool topmost = true)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return;
+        }
+
+        SetWindowPos(
+            hWnd,
+            topmost ? HWND_TOPMOST : IntPtr.Zero,
+            x,
+            y,
+            Math.Max(1, width),
+            Math.Max(1, height),
+            SWP_NOACTIVATE | (topmost ? 0u : SWP_NOZORDER));
+    }
+
+    public static void ApplyOverlayWindowStyles(IntPtr hWnd)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return;
+        }
+
+        long exStyle = GetWindowExStyle(hWnd);
+        exStyle |= WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED;
+
+        if (IntPtr.Size == 8)
+        {
+            SetWindowLongPtr64(hWnd, GWL_EXSTYLE, new IntPtr(exStyle));
+        }
+        else
+        {
+            SetWindowLong32(hWnd, GWL_EXSTYLE, unchecked((int)exStyle));
+        }
+    }
+
+    public static void SetWindowAlpha(IntPtr hWnd, double opacity)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return;
+        }
+
+        double clamped = Math.Clamp(opacity, 0.0, 1.0);
+        byte alpha = (byte)Math.Round(clamped * 255.0);
+        SetLayeredWindowAttributes(hWnd, 0, alpha, LWA_ALPHA);
+    }
+
+    public static void TrySetRoundedCorners(IntPtr hWnd)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return;
+        }
+
+        try
+        {
+            int pref = DWMWCP_ROUND;
+            DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref pref, sizeof(int));
+        }
+        catch
+        {
+            // DWM may be unavailable or the attribute unsupported; ignore.
+        }
+    }
+
+    public static void TrySetTransitionsDisabled(IntPtr hWnd, bool disabled)
+    {
+        if (!IsHandleValid(hWnd))
+        {
+            return;
+        }
+
+        try
+        {
+            int value = disabled ? 1 : 0;
+            DwmSetWindowAttribute(hWnd, DWMWA_TRANSITIONS_FORCEDISABLED, ref value, sizeof(int));
+        }
+        catch
+        {
+            // DWM may be unavailable or the attribute unsupported; ignore.
+        }
     }
 
     public static void MoveWindowPixels(IntPtr hWnd, int x, int y)
@@ -295,13 +691,17 @@ public static class Win32WindowHelper
 
             bool matchesProcess = TerminalProcessNames.Any(p =>
                 string.Equals(p, procName, StringComparison.OrdinalIgnoreCase));
-            bool isTargetMatch = string.Equals(procName, keyword, StringComparison.OrdinalIgnoreCase)
+            bool matchesKeywordProcess = string.Equals(procName, keyword, StringComparison.OrdinalIgnoreCase);
+
+            if (!matchesProcess && !matchesKeywordProcess)
+            {
+                return true;
+            }
+
+            bool isTargetMatch = matchesKeywordProcess
                 || title.Contains(keyword, StringComparison.OrdinalIgnoreCase);
 
-            if (matchesProcess || isTargetMatch)
-            {
-                results.Add(new TerminalWindowInfo(hWnd, title, procName, IsIconic(hWnd), isTargetMatch));
-            }
+            results.Add(new TerminalWindowInfo(hWnd, title, procName, IsIconic(hWnd), isTargetMatch));
 
             return true;
         }, IntPtr.Zero);
@@ -420,13 +820,13 @@ public static class Win32WindowHelper
         }
     }
 
-    private static bool IsToolWindow(IntPtr hWnd)
-    {
-        long exStyle = IntPtr.Size == 8
+    private static bool IsToolWindow(IntPtr hWnd) =>
+        (GetWindowExStyle(hWnd) & WS_EX_TOOLWINDOW) != 0;
+
+    private static long GetWindowExStyle(IntPtr hWnd) =>
+        IntPtr.Size == 8
             ? GetWindowLongPtr64(hWnd, GWL_EXSTYLE).ToInt64()
             : GetWindowLong32(hWnd, GWL_EXSTYLE);
-        return (exStyle & WS_EX_TOOLWINDOW) != 0;
-    }
 
     private static string TryGetProcessName(uint pid)
     {

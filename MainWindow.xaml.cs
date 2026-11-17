@@ -26,6 +26,14 @@ public partial class MainWindow : Window
     private HwndSource? _hwndSource;
     private IntPtr _pinnedTerminalHandle;
     private IntPtr _lastExternalForeground;
+    private IntPtr _lastObservedForeground;
+
+    private readonly Dictionary<IntPtr, Rect> _lastKnownWindowRects = new();
+    private readonly Dictionary<IntPtr, Rect> _lastKnownFrameInsets = new();
+    private bool _pendingAnchorNewSpawn;
+    private readonly Dictionary<IntPtr, System.Drawing.Bitmap> _cachedSnapshots = new();
+    private TransitionOverlayWindow? _activeOverlay;
+    private IntPtr _transitionTargetHandle = IntPtr.Zero;
 
     private TrayIconHelper? _trayIcon;
     private RegisteredWaitHandle? _wakeupRegistration;
@@ -120,7 +128,7 @@ public partial class MainWindow : Window
     {
         if (msg == Win32WindowHelper.WM_HOTKEY && wParam.ToInt32() == Win32WindowHelper.ToggleHotkeyId)
         {
-            WakeFromIdle();
+            BringBubbleIntoView(recenterToPrimary: false);
             TriggerBlackHoleEmergenceAnimation();
             HandleBubbleClick();
             handled = true;
@@ -186,6 +194,9 @@ public partial class MainWindow : Window
 
     private void MainWindow_Closed(object? sender, EventArgs e)
     {
+        CancelActiveTransition();
+        ClearCachedSnapshots();
+        _lastKnownFrameInsets.Clear();
         SaveSettings();
         _monitorTimer.Stop();
         _idleDimTimer.Stop();
@@ -328,9 +339,39 @@ public partial class MainWindow : Window
     private void MonitorTimer_Tick(object? sender, EventArgs e)
     {
         IntPtr fg = Win32WindowHelper.GetForegroundHandle();
+        bool foregroundChanged = fg != _lastObservedForeground;
+        _lastObservedForeground = fg;
+
         if (fg != IntPtr.Zero && fg != _selfHandle)
         {
             _lastExternalForeground = fg;
+        }
+
+        if (!_isMenuOpen && !_isDragging)
+        {
+            if (WindowState == WindowState.Minimized)
+            {
+                WindowState = WindowState.Normal;
+            }
+
+            if (!IsVisible)
+            {
+                Show();
+            }
+
+            if (foregroundChanged || !Win32WindowHelper.IsWindowTopmost(_selfHandle))
+            {
+                Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+            }
+
+            Rect winRect = GetCurrentWindowRectPixels();
+            if (!Win32WindowHelper.IsPointOnAnyMonitor(
+                winRect.Left + winRect.Width * 0.5,
+                winRect.Top + winRect.Height * 0.5))
+            {
+                MoveToPrimaryDefaultEdge();
+                SaveSettings();
+            }
         }
 
         if (_preLaunchWindowHandles is not null)
@@ -338,6 +379,7 @@ public partial class MainWindow : Window
             if (DateTime.UtcNow > _awaitingLaunchedWindowUntilUtc)
             {
                 _preLaunchWindowHandles = null;
+                _pendingAnchorNewSpawn = false;
             }
             else
             {
@@ -347,6 +389,45 @@ public partial class MainWindow : Window
                 {
                     _pinnedTerminalHandle = spawned.Handle;
                     _lastExternalForeground = spawned.Handle;
+
+                    Rect spawnedRect = Win32WindowHelper.GetVisibleWindowRectPixels(spawned.Handle);
+                    if (!spawnedRect.IsEmpty)
+                    {
+                        _lastKnownWindowRects[spawned.Handle] = spawnedRect;
+                    }
+                    _lastKnownFrameInsets[spawned.Handle] = Win32WindowHelper.GetWindowFrameInsetsPixels(spawned.Handle);
+
+                    if (_pendingAnchorNewSpawn)
+                    {
+                        _pendingAnchorNewSpawn = false;
+
+                        if (!Win32WindowHelper.IsRestoredAsMaximized(spawned.Handle) && !spawnedRect.IsEmpty)
+                        {
+                            Rect bubbleRect = GetCurrentWindowRectPixels();
+                            double bubbleCenterX = bubbleRect.Left + bubbleRect.Width * 0.5;
+                            double bubbleCenterY = bubbleRect.Top + bubbleRect.Height * 0.5;
+                            Rect bubbleWorkArea = Win32WindowHelper.GetMonitorWorkAreaForPointPixels(bubbleCenterX, bubbleCenterY);
+
+                            Rect anchored = WindowTransitionGeometry.ComputeAnchoredWindowRect(
+                                bubbleRect,
+                                spawnedRect,
+                                bubbleWorkArea);
+
+                            Rect insets = _lastKnownFrameInsets[spawned.Handle];
+                            Rect rawAnchored = Win32WindowHelper.ApplyFrameInsets(anchored, insets);
+
+                            Win32WindowHelper.MoveAndResizeWindowPixels(
+                                spawned.Handle,
+                                (int)Math.Round(rawAnchored.Left),
+                                (int)Math.Round(rawAnchored.Top),
+                                (int)Math.Round(rawAnchored.Width),
+                                (int)Math.Round(rawAnchored.Height),
+                                topmost: false);
+
+                            _lastKnownWindowRects[spawned.Handle] = anchored;
+                        }
+                    }
+
                     _preLaunchWindowHandles = null;
                     _awaitingLaunchedWindowUntilUtc = DateTime.MinValue;
                 }
@@ -354,6 +435,60 @@ public partial class MainWindow : Window
         }
 
         RefreshTargetAndStatus();
+
+        IntPtr trackedTarget = ResolveTargetWindow();
+        if (Win32WindowHelper.IsHandleValid(trackedTarget)
+            && !Win32WindowHelper.IsMinimized(trackedTarget))
+        {
+            Rect visibleRect = Win32WindowHelper.GetVisibleWindowRectPixels(trackedTarget);
+            if (!visibleRect.IsEmpty)
+            {
+                _lastKnownWindowRects[trackedTarget] = visibleRect;
+                _lastKnownFrameInsets[trackedTarget] = Win32WindowHelper.GetWindowFrameInsetsPixels(trackedTarget);
+            }
+        }
+
+        PruneTransitionCaches();
+    }
+
+    private void PruneTransitionCaches()
+    {
+        List<IntPtr> staleRects = _lastKnownWindowRects.Keys
+            .Where(h => !Win32WindowHelper.IsHandleValid(h))
+            .ToList();
+        foreach (IntPtr handle in staleRects)
+        {
+            _lastKnownWindowRects.Remove(handle);
+        }
+
+        List<IntPtr> staleInsets = _lastKnownFrameInsets.Keys
+            .Where(h => !Win32WindowHelper.IsHandleValid(h))
+            .ToList();
+        foreach (IntPtr handle in staleInsets)
+        {
+            _lastKnownFrameInsets.Remove(handle);
+        }
+
+        List<IntPtr> staleSnapshots = _cachedSnapshots.Keys
+            .Where(h => !Win32WindowHelper.IsHandleValid(h))
+            .ToList();
+        foreach (IntPtr handle in staleSnapshots)
+        {
+            if (_cachedSnapshots.Remove(handle, out System.Drawing.Bitmap? stale))
+            {
+                stale.Dispose();
+            }
+        }
+    }
+
+    private void ClearCachedSnapshots()
+    {
+        foreach (System.Drawing.Bitmap snapshot in _cachedSnapshots.Values)
+        {
+            snapshot.Dispose();
+        }
+
+        _cachedSnapshots.Clear();
     }
 
     private IntPtr ResolveTargetWindow()
@@ -514,6 +649,7 @@ public partial class MainWindow : Window
                 .Select(w => w.Handle)
                 .ToHashSet();
             _awaitingLaunchedWindowUntilUtc = DateTime.UtcNow.AddSeconds(5);
+            _pendingAnchorNewSpawn = true;
 
             LaunchTargetTerminal();
             Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
@@ -523,17 +659,210 @@ public partial class MainWindow : Window
 
         if (Win32WindowHelper.IsMinimized(target) || _lastExternalForeground != target)
         {
-            Win32WindowHelper.BringToFront(target);
-            _lastExternalForeground = target;
+            ShowTerminalFromBubble(target);
         }
         else
         {
-            Win32WindowHelper.MinimizeWindow(target);
-            _lastExternalForeground = IntPtr.Zero;
+            MinimizeTerminalToBubble(target);
+        }
+    }
+
+    private void ShowTerminalFromBubble(IntPtr target)
+    {
+        CancelActiveTransition();
+
+        bool isMinimized = Win32WindowHelper.IsMinimized(target);
+
+        Rect baseRect;
+        if (!isMinimized)
+        {
+            baseRect = Win32WindowHelper.GetVisibleWindowRectPixels(target);
+        }
+        else if (_lastKnownWindowRects.TryGetValue(target, out Rect cachedRect) && !cachedRect.IsEmpty)
+        {
+            baseRect = cachedRect;
+        }
+        else
+        {
+            baseRect = Win32WindowHelper.GetPredictedWindowRectPixels(target);
         }
 
+        Rect bubbleRect = GetCurrentWindowRectPixels();
+        double bubbleCenterX = bubbleRect.Left + bubbleRect.Width * 0.5;
+        double bubbleCenterY = bubbleRect.Top + bubbleRect.Height * 0.5;
+        Rect bubbleWorkArea = Win32WindowHelper.GetMonitorWorkAreaForPointPixels(bubbleCenterX, bubbleCenterY);
+
+        bool isMaximized = Win32WindowHelper.IsRestoredAsMaximized(target);
+
+        Rect targetRect = isMaximized
+            ? bubbleWorkArea
+            : WindowTransitionGeometry.ComputeAnchoredWindowRect(bubbleRect, baseRect, bubbleWorkArea);
+
+        if (targetRect.IsEmpty)
+        {
+            Win32WindowHelper.BringToFront(target);
+            _lastExternalForeground = target;
+            Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+            RefreshTargetAndStatus();
+            return;
+        }
+
+        Rect frameInsets = _lastKnownFrameInsets.TryGetValue(target, out Rect cachedInsets)
+            ? cachedInsets
+            : (isMinimized ? new Rect(0, 0, 0, 0) : Win32WindowHelper.GetWindowFrameInsetsPixels(target));
+
+        Rect rawTargetRect = Win32WindowHelper.ApplyFrameInsets(targetRect, frameInsets);
+
+        Rect snapshotRect = !baseRect.IsEmpty ? baseRect : targetRect;
+
+        System.Drawing.Bitmap? snapshot = null;
+        if (!isMinimized && Win32WindowHelper.IsForeground(target))
+        {
+            snapshot = WindowSnapshotHelper.CaptureWindowSnapshot(snapshotRect);
+
+            if (snapshot is not null)
+            {
+                if (_cachedSnapshots.Remove(target, out System.Drawing.Bitmap? previous))
+                {
+                    previous.Dispose();
+                }
+
+                _cachedSnapshots[target] = snapshot;
+            }
+        }
+        else
+        {
+            _cachedSnapshots.TryGetValue(target, out snapshot);
+        }
+
+        Rect bubbleOrigin = WindowTransitionGeometry.ComputeBubbleOriginRect(
+            bubbleRect,
+            targetRect);
+
+        Win32WindowHelper.TrySetTransitionsDisabled(target, true);
+
+        var overlay = new TransitionOverlayWindow();
+        _activeOverlay = overlay;
+        _transitionTargetHandle = target;
+
+        Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+
+        overlay.StartEmerge(
+            bubbleOrigin,
+            targetRect,
+            snapshot,
+            _selfHandle,
+            onRevealTarget: () =>
+            {
+                if (isMaximized)
+                {
+                    Win32WindowHelper.BringToFront(target);
+                    Win32WindowHelper.MoveMaximizedWindowToMonitor(target, bubbleWorkArea);
+                }
+                else
+                {
+                    if (Win32WindowHelper.IsMinimized(target))
+                    {
+                        Win32WindowHelper.SetMinimizedNormalRect(target, rawTargetRect);
+                    }
+
+                    Win32WindowHelper.BringToFront(target);
+                    Win32WindowHelper.MoveAndResizeWindowPixels(
+                        target,
+                        (int)Math.Round(rawTargetRect.Left),
+                        (int)Math.Round(rawTargetRect.Top),
+                        (int)Math.Round(rawTargetRect.Width),
+                        (int)Math.Round(rawTargetRect.Height),
+                        topmost: false);
+
+                    _lastKnownWindowRects[target] = targetRect;
+                }
+
+                _lastExternalForeground = target;
+                Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+                RefreshTargetAndStatus();
+            },
+            onFinished: () =>
+            {
+                Win32WindowHelper.TrySetTransitionsDisabled(target, false);
+                _activeOverlay = null;
+                _transitionTargetHandle = IntPtr.Zero;
+                Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+            });
+
+        Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+    }
+
+    private void MinimizeTerminalToBubble(IntPtr target)
+    {
+        CancelActiveTransition();
+
+        Rect targetRect = Win32WindowHelper.GetVisibleWindowRectPixels(target);
+        if (targetRect.IsEmpty)
+        {
+            Win32WindowHelper.MinimizeWindow(target);
+            _lastExternalForeground = IntPtr.Zero;
+            Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+            RefreshTargetAndStatus();
+            return;
+        }
+
+        _lastKnownWindowRects[target] = targetRect;
+
+        System.Drawing.Bitmap? snapshot = WindowSnapshotHelper.CaptureWindowSnapshot(targetRect);
+
+        if (snapshot is not null)
+        {
+            if (_cachedSnapshots.Remove(target, out System.Drawing.Bitmap? previous))
+            {
+                previous.Dispose();
+            }
+
+            _cachedSnapshots[target] = snapshot;
+        }
+
+        Rect bubbleOrigin = WindowTransitionGeometry.ComputeBubbleOriginRect(
+            GetCurrentWindowRectPixels(),
+            targetRect);
+
+        Win32WindowHelper.TrySetTransitionsDisabled(target, true);
+
+        var overlay = new TransitionOverlayWindow();
+        _activeOverlay = overlay;
+        _transitionTargetHandle = target;
+
+        Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
+
+        overlay.StartCollapse(
+            targetRect,
+            bubbleOrigin,
+            snapshot,
+            _selfHandle,
+            onFinished: () =>
+            {
+                Win32WindowHelper.TrySetTransitionsDisabled(target, false);
+                _activeOverlay = null;
+                _transitionTargetHandle = IntPtr.Zero;
+            });
+
+        Win32WindowHelper.MinimizeWindow(target);
+        _lastExternalForeground = IntPtr.Zero;
         Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
         RefreshTargetAndStatus();
+    }
+
+    private void CancelActiveTransition()
+    {
+        TransitionOverlayWindow? overlay = _activeOverlay;
+        _activeOverlay = null;
+
+        overlay?.Cancel();
+
+        if (_transitionTargetHandle != IntPtr.Zero)
+        {
+            Win32WindowHelper.TrySetTransitionsDisabled(_transitionTargetHandle, false);
+            _transitionTargetHandle = IntPtr.Zero;
+        }
     }
 
     private void Bubble_MouseRightButtonUp(object sender, MouseButtonEventArgs e)
@@ -587,9 +916,7 @@ public partial class MainWindow : Window
                 item.Click += (_, _) =>
                 {
                     _pinnedTerminalHandle = term.Handle;
-                    Win32WindowHelper.BringToFront(term.Handle);
-                    Win32WindowHelper.EnsureTopmostNoActivate(_selfHandle);
-                    RefreshTargetAndStatus();
+                    ShowTerminalFromBubble(term.Handle);
                 };
                 menu.Items.Add(item);
             }
